@@ -6,7 +6,7 @@ env:
   BUILD_TYPE: Release
 
 jobs:
-  build:
+  build-bindiff:
     strategy:
       fail-fast: false
       matrix:
@@ -22,25 +22,20 @@ jobs:
         path: bindiff
     - uses: actions/checkout@v4
       with:
-        repository: google/binexport
+        repository: alula/binexport
         path: binexport
 
-    - name: Install ninja-build tool
-      uses: turtlesec-no/get-ninja@1.1.0
+    - name: Setup CMake and Ninja
+      uses: lukka/get-cmake@v4.0.2
+      with:
+        cmakeVersion: 4.0.2
+        ninjaVersion: 1.12.1
 
     - name: Create Build Environment
-      env:
-        IDASDK_SECRET: ${{ secrets.IDASDK_SECRET }}
       working-directory: ${{ github.workspace }}
       shell: bash
       run: |
-        mkdir -p "${{ runner.workspace }}/build" \
-                 ida/idasdk
-        mv binexport/ida/idasdk/idasdk*.gpg \
-           ida/idasdk/
-        binexport/.github/scripts/decrypt_secret.sh
-        unzip -q "${{ runner.workspace }}/build/idasdk_teams82.zip" \
-              -d "${{ runner.workspace }}/build/"
+        mkdir -p "${{ runner.workspace }}/build"
 
     - name: Enable Developer Command Prompt (Windows)
       if: matrix.os == 'windows-2022'
@@ -55,8 +50,7 @@ jobs:
       shell: bash
       run: |
         cmake "${{ github.workspace }}/bindiff" -G Ninja \
-          "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}" \
-          "-DIdaSdk_ROOT_DIR=${{ runner.workspace }}/build/idasdk_teams82"
+          "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}"
 
     - name: Build
       working-directory: ${{ runner.workspace }}/build
@@ -69,10 +63,146 @@ jobs:
       run: ctest --build-config "${BUILD_TYPE}" --output-on-failure -R '^[A-Z]'
 
     - name: Upload Build Artifacts
-      uses: actions/upload-artifact@v3.1.2
+      uses: actions/upload-artifact@v4
       with:
         name: BinDiff-${{ runner.os }}
         path: |
           ${{ runner.workspace }}/build/bindiff
           ${{ runner.workspace }}/build/ida/bindiff*
           ${{ runner.workspace }}/build/tools/bindiff*
+
+  build-binexport:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-22.04
+        - os: macos-12
+        - os: windows-2022
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: alula/binexport
+        path: binexport
+
+    - name: Setup CMake and Ninja
+      uses: lukka/get-cmake@v4.0.2
+      with:
+        cmakeVersion: 4.0.2
+        ninjaVersion: 1.12.1
+
+    - name: Create Build Environment
+      working-directory: ${{ github.workspace }}
+      shell: bash
+      run: |
+        mkdir -p "${{ runner.workspace }}/build-binexport"
+
+    - name: Enable Developer Command Prompt (Windows)
+      if: matrix.os == 'windows-2022'
+      uses: ilammy/msvc-dev-cmd@v1.12.1
+
+    - name: Enable mold linker (Linux)
+      if: matrix.os == 'ubuntu-22.04'
+      uses: rui314/setup-mold@v1
+
+    - name: Configure CMake
+      working-directory: ${{ runner.workspace }}/build-binexport
+      shell: bash
+      run: |
+        cmake "${{ github.workspace }}/binexport" -G Ninja \
+          "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}"
+
+    - name: Build
+      working-directory: ${{ runner.workspace }}/build-binexport
+      shell: bash
+      run: cmake --build . --config "${BUILD_TYPE}"
+
+    - name: Test
+      working-directory: ${{ runner.workspace }}/build-binexport
+      shell: bash
+      run: ctest --build-config "${BUILD_TYPE}" --output-on-failure
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: BinExport-${{ runner.os }}
+        path: |
+          ${{ runner.workspace }}/build-binexport/binaryninja/binexport*
+          ${{ runner.workspace }}/build-binexport/ida/binexport*
+          ${{ runner.workspace }}/build-binexport/tools/binexport2dump*
+
+  package-release:
+    if: github.ref_type == 'tag'
+    needs: [build-bindiff, build-binexport]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create release directory structure
+      run: |
+        mkdir -p release-binaries
+        
+        # Create platform-specific directories
+        for platform in Linux macOS Windows; do
+          mkdir -p "temp/$platform/bindiff"
+          mkdir -p "temp/$platform/binexport"
+        done
+
+    - name: Organize artifacts by platform
+      run: |
+        # Move BinDiff artifacts
+        if [ -d "artifacts/BinDiff-Linux" ]; then
+          cp -r artifacts/BinDiff-Linux/* temp/Linux/bindiff/
+        fi
+        if [ -d "artifacts/BinDiff-macOS" ]; then
+          cp -r artifacts/BinDiff-macOS/* temp/macOS/bindiff/
+        fi
+        if [ -d "artifacts/BinDiff-Windows" ]; then
+          cp -r artifacts/BinDiff-Windows/* temp/Windows/bindiff/
+        fi
+        
+        # Move BinExport artifacts
+        if [ -d "artifacts/BinExport-Linux" ]; then
+          cp -r artifacts/BinExport-Linux/* temp/Linux/binexport/
+        fi
+        if [ -d "artifacts/BinExport-macOS" ]; then
+          cp -r artifacts/BinExport-macOS/* temp/macOS/binexport/
+        fi
+        if [ -d "artifacts/BinExport-Windows" ]; then
+          cp -r artifacts/BinExport-Windows/* temp/Windows/binexport/
+        fi
+
+    - name: Create platform-specific release packages
+      run: |
+        cd temp
+        
+        # Create Linux package
+        if [ -d "Linux" ] && [ "$(ls -A Linux)" ]; then
+          zip -r "../release-binaries/bindiff-binexport-${{ github.ref_name }}-linux.zip" Linux/*
+        fi
+        
+        # Create macOS package  
+        if [ -d "macOS" ] && [ "$(ls -A macOS)" ]; then
+          zip -r "../release-binaries/bindiff-binexport-${{ github.ref_name }}-macos.zip" macOS/*
+        fi
+        
+        # Create Windows package
+        if [ -d "Windows" ] && [ "$(ls -A Windows)" ]; then
+          zip -r "../release-binaries/bindiff-binexport-${{ github.ref_name }}-windows.zip" Windows/*
+        fi
+
+    - name: Upload binaries to release
+      uses: svenstaro/upload-release-action@v2
+      if: ${{ github.ref_type == 'tag' }}
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: release-binaries/*
+        tag: ${{ github.ref }}
+        overwrite: true
+        file_glob: true
